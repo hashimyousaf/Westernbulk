@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  LambdaFuncName:
+    Type: String
+    Default: vessel-lambdas
+  DynamoDBTableName:
+    Type: String
+    Default: Vessel
+  APIName:
+    Type: String
+    Default: API-vessel-lambda
+  EnvironmentName:
+    Type: String
+    Default: Prod
+Resources:
+  PutLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+
+          def handler(event, context):
+              print("Value of the event object = ", event)
+
+              if event.get('vesselId'):
+                  dynamo_db = boto3.resource('dynamodb')
+                  vessel_table = dynamo_db.Table("Vessel")
+                  try:
+                      vessel_table.put_item(
+                          Item={
+                              'vesselId': event.get('vesselId'),
+                              'vesselName': event.get('vesselName'),
+                              'speed': event.get('speed'),
+                              'latitude': event.get('latitude'),
+                              'longitude': event.get('longitude')
+                          })
+                      print("Successfully inserted item")
+                  except Exception as ex:
+                      print("Exception Error = {}".format(ex))
+                      raise ex
+              else:
+                  print("vesselId Can not be empty in the event = {}".format(event))
+
+              return {
+                  'body': "Successfully inserted vessel with id = {}".format(event.get('vesselId'))
+              }
+      FunctionName: put-vessel-lambda
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt IAMRole.Arn
+
+  GetLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+
+
+          def handler(event, context):
+              print("Value of the event object = ", event)
+
+              if event.get("id"):
+                  dynamo_db = boto3.resource('dynamodb')
+                  vessel_table = dynamo_db.Table("Vessel")
+                  try:
+                      response = vessel_table.get_item(Key=
+                      {
+                          'vesselId': event.get('id')
+                      })
+                  except ClientError as e:
+                      print(e.response['Error']['Message'])
+                  else:
+                      vessel = response.get('Item')
+                      if vessel:
+                          print("Vessel info = ", vessel)
+                          return vessel
+                      else:
+                          print("No vessel found with id = {}".format(event.get('id')))
+                          return {'msg': "No vessel found with id = {}".format(event.get('id'))}
+              else:
+                  print("id Can not be empty in the event = {}".format(event))
+      FunctionName: get-vessel-lambda
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt IAMRole.Arn
+
+  VesselTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: Vessel
+      AttributeDefinitions:
+      - AttributeName: "vesselId"
+        AttributeType: N
+      KeySchema:
+      - AttributeName: "vesselId"
+        KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  APIGatewayRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name:
+        Ref: APIName
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+    DependsOn:
+      - PutLambdaFunction
+
+  APIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart:
+        Ref: LambdaFuncName
+
+  APIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ApiKeyRequired: true
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt PutLambdaFunction.Arn
+
+  APIGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+    DependsOn:
+      - APIGatewayMethod
+
+  Prod:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName:
+        Ref: EnvironmentName
+      Description: Prod Stage
+      RestApiId: !Ref APIGatewayRestAPI
+      DeploymentId: !Ref APIGatewayDeployment
+
+  ApiKey:
+    Type: 'AWS::ApiGateway::ApiKey'
+    DependsOn:
+    - APIGatewayDeployment
+    Properties:
+      Name: ApiKey
+      Description: CloudFormation API Key Prod
+      Enabled: true
+      StageKeys:
+      - RestApiId: !Ref APIGatewayRestAPI
+        StageName: !Ref Prod
+
+  usagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    Properties:
+      ApiStages:
+      - ApiId: !Ref APIGatewayRestAPI
+        Stage: !Ref Prod
+      Description: put_api_usage_plan usage plan
+      Quota:
+        Limit: 5000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+      UsagePlanName: put_api_usage_plan
+
+  usagePlanKey:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref usagePlan
+
+  APIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt PutLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Policy_api-lambda-db
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:TagResource'
+                  - 'dynamodb:UntagResource'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+Outputs:
+  PutLambdaFunction:
+    Description: Put lambda function info
+    Value: !GetAtt PutLambdaFunction.Arn
+  GetLambdaFunction:
+    Description: Get lambda function info
+    Value: !GetAtt PutLambdaFunction.Arn
+
+
